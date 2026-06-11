@@ -2,7 +2,7 @@
 
 openFrameworks addon for **variable fonts** (and static TTF/OTF): load, set design axes, kern, and render as **`ofPath`** outlines or **`drawString()`** in your coordinate units (px, mm, …).
 
-![preview](example\preview.png)
+![preview](example/preview.png)
 
 ## Features
 
