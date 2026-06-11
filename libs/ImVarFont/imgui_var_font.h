@@ -1,0 +1,250 @@
+// imgui_var_font.h  –  Variable-font rendering and axis controls for Dear ImGui
+//
+// Renders glyph outlines directly into an ImDrawList using FreeType for
+// outline extraction.  Variable-font design axes are exposed as ImGui slider
+// widgets; any font that FreeType can open (OTF/TTF, static or variable) works.
+//
+// Usage (minimal):
+//   ImVarFont::Face* face = ImVarFont::LoadFace("MyFont.ttf");
+//   // In your frame loop:
+//   if (ImVarFont::AxisSliders(face))
+//       ImVarFont::ApplyAxes(face);
+//   ImVarFont::AddText(ImGui::GetWindowDrawList(), face,
+//                      96.f, ImVec2(x, y), IM_COL32_WHITE, "Hello");
+//   // Cleanup:
+//   ImVarFont::FreeFace(face);
+//
+// Required: FreeType 2.x  (link with freetype)
+// Optional: nothing else  (only imgui.h)
+//
+// License: MIT
+
+#pragma once
+#include "imgui.h"
+#include <cstdint>
+#include <vector>
+
+namespace ImVarFont {
+
+// ---------------------------------------------------------------------------
+// Render quality
+// ---------------------------------------------------------------------------
+
+enum class RenderMode {
+    Vector,        // Unhinted design-unit outlines (best for zoom / extrapolation)
+    HintedVector,  // Hinted outlines at em_px, drawn as ImDrawList paths
+    Raster,        // FreeType grayscale bitmap composite (best static quality)
+};
+
+enum class HintingFlags {
+    Native,    // Font native hinter + FT_LOAD_TARGET_NORMAL
+    Light,     // FT_LOAD_TARGET_LIGHT (ClearType-style vertical snap)
+    AutoHint,  // FT_LOAD_FORCE_AUTOHINT
+};
+
+struct Face;
+
+RenderMode    GetRenderMode(const Face* face);
+void          SetRenderMode(Face* face, RenderMode mode);
+HintingFlags  GetHintingFlags(const Face* face);
+void          SetHintingFlags(Face* face, HintingFlags flags);
+const char*   GetRenderModeLabel(RenderMode mode);
+const char*   GetHintingFlagsLabel(HintingFlags flags);
+
+// ---------------------------------------------------------------------------
+// Axis  –  one per design axis in the font
+// ---------------------------------------------------------------------------
+struct Axis {
+    ImU32  Tag;             // 4-byte OpenType tag, e.g. 0x77676874 = 'wght'
+    char   Name[64];        // Human-readable name from the font's 'fvar' table
+    float  Min;
+    float  Max;
+    float  Default;
+    float  Value;           // Current value – modify then call ApplyAxes()
+};
+
+// ---------------------------------------------------------------------------
+// Opaque face handle (defined internally)
+// ---------------------------------------------------------------------------
+
+// Lifecycle
+
+// Load a font file.  Works with static and variable OTF/TTF fonts.
+// Returns nullptr on failure.
+// If err_buf/err_buf_size are provided, a human-readable message is written on failure.
+Face* LoadFace(const char* path, char* err_buf = nullptr, int err_buf_size = 0);
+
+// Release all resources.  Safe to call with nullptr.
+void  FreeFace(Face* face);
+
+// ---------------------------------------------------------------------------
+// Introspection
+// ---------------------------------------------------------------------------
+
+bool        IsLoaded(const Face* face);
+bool        IsVariable(const Face* face);
+const char* GetFamilyName(const Face* face);  // e.g. "Inter"
+const char* GetStyleName(const Face* face);   // e.g. "Regular"
+const char* GetFilePath(const Face* face);
+
+// True when the font has any kerning source (legacy kern table and/or GPOS).
+bool HasKerning(const Face* face);
+
+// True when the font file contains a legacy 'kern' table.
+bool HasKernTable(const Face* face);
+
+// True when the font file contains GPOS positioning data (requires HarfBuzz at build time).
+bool HasGpos(const Face* face);
+
+// True when HarfBuzz is linked and this face was shaped with it.
+bool UsesHarfBuzz(const Face* face);
+
+// Kerning master switch.
+bool GetUseKerning(const Face* face);
+void SetUseKerning(Face* face, bool enabled);
+
+// Use HarfBuzz / GPOS for pair spacing when kerning is on.
+bool GetUseHarfBuzz(const Face* face);
+void SetUseHarfBuzz(Face* face, bool enabled);
+
+// Use the legacy 'kern' table for pair spacing when kerning is on.
+bool GetUseKernTable(const Face* face);
+void SetUseKernTable(Face* face, bool enabled);
+
+// Active backend label: "off", "HarfBuzz (GPOS)", "kern table", "none", etc.
+const char* GetKerningEngineLabel(const Face* face);
+
+// Legacy 'kern' table pair value in pixels (0 if unavailable).
+float GetKernTablePairPx(const Face* face, unsigned int cp_left, unsigned int cp_right,
+                         float em_px);
+
+// Extra pair spacing from GPOS via HarfBuzz at em_px (0 if unavailable).
+float GetGposPairExtraPx(const Face* face, unsigned int cp_left, unsigned int cp_right,
+                          float em_px);
+
+// Scrollable inspector for non-zero kern pairs (ASCII subset).
+void KernTableUi(const Face* face, float em_px);
+
+// ---------------------------------------------------------------------------
+// Axis control
+// ---------------------------------------------------------------------------
+
+int   GetAxisCount(const Face* face);
+Axis* GetAxes(Face* face);               // Pointer valid until FreeFace()
+
+// Write v to axes[axis_idx].Value, clamping to [Min, Max] unless clamp=false.
+// Pass clamp=false to allow extrapolation beyond the font's defined axis range.
+void  SetAxisValue(Face* face, int axis_idx, float v, bool clamp = true);
+
+// Reset all axes to their Default values and call ApplyAxes().
+void  ResetAxes(Face* face);
+
+// Push the current Axis::Value array to FreeType.
+// When allow_extrapolation=true, values beyond fvar min/max are clamped for
+// FreeType but a synthetic outline stretch is applied at render time.
+void  ApplyAxes(Face* face, bool allow_extrapolation = false);
+
+// ---------------------------------------------------------------------------
+// ImGui widgets
+// ---------------------------------------------------------------------------
+
+// When allow_extrapolation=true each axis shows an unclamped DragFloat
+// (infinite drag + click to type). Values beyond the font's fvar range are
+// clamped for FreeType but extrapolated visually in AddText().
+bool AxisSliders(Face* face, const char* str_id = "##imvarfont_axes",
+                 bool allow_extrapolation = false);
+
+// Family/style name, variable flag, axis min/max/default table, current values.
+void MetadataTable(const Face* face);
+
+// Load face into atlas using FreeType, applying current axis values.
+// Caller should ClearFonts() first. Returns nullptr on failure.
+// Requires IMGUI_ENABLE_FREETYPE and imgui_freetype.cpp linked into the app.
+ImFont* SetImGuiFont(ImFontAtlas* atlas, Face* face, float size_pixels);
+
+// ---------------------------------------------------------------------------
+// Rendering  (outlines → ImDrawList, no texture atlas required)
+// ---------------------------------------------------------------------------
+
+// Render UTF-8 text as filled glyph outlines into dl.
+//
+//   em_px              : em-square size in screen pixels  (controls text size)
+//   pos                : top-left corner of the text block in screen coordinates
+//                        (baseline sits at pos.y + ascender * scale)
+//   col                : fill colour, e.g. IM_COL32(255, 255, 255, 255)
+//   fill               : when true, fill glyph contours
+//   outline            : when true, stroke each contour (can combine with fill)
+//   outline_thickness  : stroke width in pixels (only used when outline is true)
+//   line_height_px     : vertical advance per newline; 0 = font default
+//   letter_spacing_px  : extra gap after each glyph except the last on a line; 0 = none
+//
+// Returns the total advance width of the rendered string in pixels.
+float AddText(ImDrawList* dl, Face* face,
+              float em_px, ImVec2 pos,
+              ImU32 col, const char* text,
+              bool fill = true,
+              bool outline = false,
+              float outline_thickness = 1.5f,
+              float line_height_px = 0.f,
+              float letter_spacing_px = 0.f);
+
+// Measure total advance width without rendering (useful for centring).
+float CalcTextWidth(Face* face, float em_px, const char* text,
+                    float letter_spacing_px = 0.f);
+
+// Returns ascender height in pixels above the baseline (positive value).
+// Use with CalcDescenderPx to centre text properly in a canvas.
+float CalcAscenderPx(const Face* face, float em_px);
+
+// Returns descender depth in pixels below the baseline (positive value).
+float CalcDescenderPx(const Face* face, float em_px);
+
+// Returns line spacing in pixels (matches AddText newline advance).
+float CalcLineHeightPx(const Face* face, float em_px);
+
+// Composite UTF-8 text to an RGBA8888 buffer (for Raster preview mode).
+// Returns false when face/text is invalid.  out_w/out_h are set to pixel size.
+bool RasterizeText(Face* face, float em_px, const char* text, ImU32 col,
+                   float line_height_px, float letter_spacing_px,
+                   std::vector<uint8_t>& out_rgba,
+                   int& out_w, int& out_h);
+
+// ---------------------------------------------------------------------------
+// Layout export (for plotter / ofPath integrations)
+// ---------------------------------------------------------------------------
+
+struct PlacedGlyph {
+    uint32_t glyph_index = 0;
+    float    x           = 0.f;
+    float    y           = 0.f;
+};
+
+// Lay out UTF-8 text and return pen positions in the same units as em_px.
+void LayoutGlyphs(Face* face, const char* text, float em_px,
+                  float line_height_px, float letter_spacing_px,
+                  std::vector<PlacedGlyph>& out);
+
+// Opaque access to the underlying FreeType face (cast to FT_Face in .cpp).
+void* GetFtFace(Face* face);
+
+// ---------------------------------------------------------------------------
+// Tag helpers
+// ---------------------------------------------------------------------------
+
+static inline ImU32 MakeTag(char a, char b, char c, char d) {
+    return ((ImU32)(unsigned char)a << 24)
+         | ((ImU32)(unsigned char)b << 16)
+         | ((ImU32)(unsigned char)c <<  8)
+         | ((ImU32)(unsigned char)d);
+}
+
+// Fill out[5] with the 4-char tag string and a null terminator.
+static inline void TagToStr(ImU32 tag, char out[5]) {
+    out[0] = (char)((tag >> 24) & 0xFF);
+    out[1] = (char)((tag >> 16) & 0xFF);
+    out[2] = (char)((tag >>  8) & 0xFF);
+    out[3] = (char)( tag        & 0xFF);
+    out[4] = '\0';
+}
+
+} // namespace ImVarFont
