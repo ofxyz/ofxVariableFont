@@ -1,0 +1,11 @@
+ofxEnTT
+ofxEnTTKit
+ofxEnTTInspector
+ofxImGui
+ofxImGuiFileDialog
+ofxImGuiStyle
+ofxImGuizmo
+ofxKit
+ofxImGuiNodeEditor
+ofxPBD
+ofxVariableFont

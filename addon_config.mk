@@ -6,8 +6,8 @@ meta:
 	ADDON_URL = https://www.github.com/ofxyz/ofxVariableFont
 
 common:
-	ADDON_DEPENDENCIES = ofxImGui ofxClipper2
-	ADDON_CPPFLAGS += -DIMVARFONT_USE_CLIPPER2
+	ADDON_DEPENDENCIES = ofxImGui
+	ADDON_SOURCES += src/VarFontNodes.cpp
 
 msys2:
 	ADDON_CPPFLAGS += -DIMVARFONT_USE_HARFBUZZ

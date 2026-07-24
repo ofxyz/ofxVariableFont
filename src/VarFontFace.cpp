@@ -1,6 +1,7 @@
 #include "VarFontFace.h"
 
 #include "ofMain.h"
+#include "ofAppGLFWWindow.h"
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
@@ -121,7 +122,7 @@ bool VarFontFace::load(const of::filesystem::path& path) {
     char err[512] = {};
     m_face = ImVarFont::LoadFace(pathStr.c_str(), err, sizeof(err));
     if (!m_face) {
-        ofLogError("VarFontFace") << (err[0] ? err : "LoadFace failed") << " — " << pathStr;
+        ofLogError("VarFontFace") << (err[0] ? err : "LoadFace failed") << " - " << pathStr;
         return false;
     }
 
@@ -132,7 +133,7 @@ bool VarFontFace::load(const of::filesystem::path& path) {
 
     ofLogNotice("VarFontFace") << "Loaded " << m_familyName << " " << m_styleName
                                << (isVariable() ? " (variable)" : " (static)")
-                               << " — axes: " << m_axes.size()
+                               << " - axes: " << m_axes.size()
                                << ", kerning: " << ImVarFont::GetKerningEngineLabel(m_face);
     return true;
 }
@@ -290,6 +291,26 @@ const char* VarFontFace::kerningEngineLabel() const {
     return m_face ? ImVarFont::GetKerningEngineLabel(m_face) : "none";
 }
 
+void VarFontFace::setOpenTypeFeature(const std::string& tag, uint32_t value) {
+    if (m_face) ImVarFont::SetFeature(m_face, tag.c_str(), value);
+}
+
+void VarFontFace::clearOpenTypeFeature(const std::string& tag) {
+    if (m_face) ImVarFont::ClearFeature(m_face, tag.c_str());
+}
+
+void VarFontFace::clearOpenTypeFeatures() {
+    if (m_face) ImVarFont::ClearAllFeatures(m_face);
+}
+
+int VarFontFace::setOpenTypeFeaturesString(const std::string& features) {
+    return m_face ? ImVarFont::SetFeaturesString(m_face, features.c_str()) : 0;
+}
+
+bool VarFontFace::getOpenTypeFeature(const std::string& tag, uint32_t& outValue) const {
+    return m_face && ImVarFont::GetFeatureValue(m_face, tag.c_str(), &outValue);
+}
+
 float VarFontFace::getKerningMM(uint32_t left, uint32_t right, float emMM) const {
     if (!m_face) return 0.f;
     return ImVarFont::GetKernTablePairPx(m_face, left, right, emMM);
@@ -348,6 +369,102 @@ void VarFontFace::drawString(const std::string& utf8, float x, float y, float em
         if (p.getOutline().empty()) continue;
         p.draw();
     }
+}
+
+namespace {
+
+static float hostFramebufferScale() {
+    if (auto* win = dynamic_cast<ofAppGLFWWindow*>(ofGetWindowPtr())) {
+        const int s = win->getPixelScreenCoordScale();
+        if (s > 0) return (float)s;
+    }
+    return 1.f;
+}
+
+static void emitGlyphQuadOf(const ImVarFont::GlyphQuad& q, void*) {
+    if (q.tex == 0)
+        return;
+
+    // Programmable OF ignores bare glBindTexture+mesh; wrap the atlas id so the
+    // default textured shader samples coverage correctly.
+    ofTexture tex;
+    tex.setUseExternalTextureID(q.tex);
+    ofTextureData& d = tex.getTextureData();
+    d.textureTarget    = GL_TEXTURE_2D;
+    d.bAllocated       = true;
+    d.bFlipTexture     = false;
+    d.glInternalFormat = GL_RGBA;
+    d.width = d.height = 1.f;
+    d.tex_w = d.tex_h = 1.f;
+    d.tex_t = d.tex_u = 1.f;
+
+    ofPushStyle();
+    ofEnableAlphaBlending();
+    ofDisableDepthTest();
+    ofSetColor((q.col      ) & 0xff,
+               (q.col >>  8) & 0xff,
+               (q.col >> 16) & 0xff,
+               (q.col >> 24) & 0xff);
+
+    ofMesh mesh;
+    mesh.setMode(OF_PRIMITIVE_TRIANGLES);
+    auto add = [&](float px, float py, float u, float v) {
+        mesh.addVertex({ px, py, 0.f });
+        mesh.addTexCoord({ u, v });
+        mesh.addColor(ofFloatColor::white);
+    };
+    add(q.x0, q.y0, q.u0, q.v0);
+    add(q.x1, q.y0, q.u1, q.v0);
+    add(q.x1, q.y1, q.u1, q.v1);
+    add(q.x0, q.y0, q.u0, q.v0);
+    add(q.x1, q.y1, q.u1, q.v1);
+    add(q.x0, q.y1, q.u0, q.v1);
+
+    tex.bind();
+    mesh.draw();
+    tex.unbind();
+    ofPopStyle();
+}
+
+static void restoreOfGlAfterVarFont() {
+    // varfont_gl touches VAO/program/texture; leave OF's programmable path sane
+    // for the rest of the frame (ImGui, ofPath, etc.).
+#ifndef TARGET_OPENGLES
+    glBindVertexArray(0);
+#endif
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glUseProgram(0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+} // namespace
+
+void VarFontFace::drawStringGpu(const std::string& utf8, float x, float y, float emSize,
+                                ofColor color, const StringLayoutOptions& opts) const
+{
+    if (!m_face || utf8.empty() || emSize <= 0.f)
+        return;
+    if (!ImVarFont::RendererReady()) {
+        ofLogWarning("VarFontFace") << "drawStringGpu: GPU renderer not ready "
+                                       "(call ImVarFont::InitRenderer first)";
+        return;
+    }
+
+    ImVarFont::BeginHostFrame((int)ofGetFrameNum(), hostFramebufferScale());
+    ImVarFont::SetGlyphQuadEmitter(&emitGlyphQuadOf, nullptr);
+
+    ImVarFont::TextStyle st;
+    st.fill              = true;
+    st.outline           = false;
+    st.line_height_px    = ImVarFont::CalcLineHeightPx(m_face, emSize) * opts.lineHeightMult;
+    st.letter_spacing_px = opts.letterSpacingEm * emSize;
+
+    const ImU32 col = IM_COL32(color.r, color.g, color.b, color.a);
+    ImVarFont::AddText(nullptr, m_face, emSize, ImVec2(x, y), col, utf8.c_str(), st);
+
+    ImVarFont::SetGlyphQuadEmitter(nullptr, nullptr);
+    restoreOfGlAfterVarFont();
 }
 
 } // namespace varfont

@@ -11,13 +11,22 @@
 //       ImVarFont::ApplyAxes(face);
 //   ImVarFont::AddText(ImGui::GetWindowDrawList(), face,
 //                      96.f, ImVec2(x, y), IM_COL32_WHITE, "Hello");
+//
+// Usage (with styling):
+//   ImVarFont::TextStyle st;
+//   st.outline           = true;
+//   st.outline_thickness = 2.f;
+//   st.letter_spacing_px = 1.f;
+//   ImVarFont::AddText(ImGui::GetWindowDrawList(), face,
+//                      96.f, ImVec2(x, y), IM_COL32_WHITE, "Hello", st);
+//
 //   // Cleanup:
 //   ImVarFont::FreeFace(face);
 //
 // Required: FreeType 2.x  (link with freetype)
 // Optional: nothing else  (only imgui.h)
 //
-// License: MIT
+// License: MIT  (WTFPL if your name is Omar Cornut — thanks for Dear ImGui)
 
 #pragma once
 #include "imgui.h"
@@ -34,6 +43,9 @@ enum class RenderMode {
     Vector,        // Unhinted design-unit outlines (best for zoom / extrapolation)
     HintedVector,  // Hinted outlines at em_px, drawn as ImDrawList paths
     Raster,        // FreeType grayscale bitmap composite (best static quality)
+    LoopBlinn,     // Unhinted outlines filled analytically (Loop-Blinn quadratics)
+    LoopBlinnLive, // Loop-Blinn re-rendered every frame (no atlas cache); for
+                   // re-rasterization-free zoom / variable-axis morphing
 };
 
 enum class HintingFlags {
@@ -43,6 +55,110 @@ enum class HintingFlags {
 };
 
 struct Face;
+
+// ---------------------------------------------------------------------------
+// GPU renderer lifecycle
+//
+// The analytic glyph renderer rasterizes coverage on the GPU. Call InitRenderer
+// once a GL context is current, passing your GL proc loader (e.g.
+// glfwGetProcAddress), and ShutdownRenderer before the context is destroyed.
+// When InitRenderer succeeds but the GPU coverage path is unavailable (OpenGL
+// ES 2 / WebGL1, or no blendable float target), filled text is rasterized on the
+// CPU with FreeType into the same atlas. If InitRenderer is never called (or
+// fails outright), filled text is skipped.
+//
+// ForceCpuFallback(true) disables the GPU path so the CPU fallback can be
+// exercised on a desktop GL build — for testing only. It can be toggled live
+// (e.g. from a checkbox); cached glyphs re-render on the next frame.
+// ---------------------------------------------------------------------------
+bool InitRenderer(void* (*gl_get_proc_address)(const char*));
+void ShutdownRenderer();
+bool RendererReady();
+void ForceCpuFallback(bool enable);
+
+// ---------------------------------------------------------------------------
+// Non-ImGui hosts (openFrameworks / game engines)
+//
+// ImVarFont owns Face/morph/layout; varfont_gl owns the GPU coverage atlas.
+// Hosts only composite filled atlas quads:
+//   • ImGui  — ImDrawList::AddImage (default when no emitter is set)
+//   • others — BeginHostFrame each frame, SetGlyphQuadEmitter, AddText(nullptr,…)
+// Outline stroking still needs a non-null ImDrawList.
+// Scene-layer FBO blends (e.g. ofxCompositorKit) are app-level; not this API.
+// ---------------------------------------------------------------------------
+struct GlyphQuad {
+    unsigned int tex = 0;
+    float        x0  = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f; // screen px, y-down
+    float        u0  = 0.f, v0 = 0.f, u1 = 1.f, v1 = 1.f;
+    uint32_t     col = 0xffffffffu; // ImU32 / IM_COL32 packing
+};
+using EmitGlyphQuadFn = void (*)(const GlyphQuad& q, void* user);
+
+// Call once per host frame before filled-glyph draws. framebuffer_scale is the
+// window→framebuffer ratio (HiDPI); 0 keeps the previous override or falls back
+// to ImGui::GetIO().DisplayFramebufferScale when an ImGui context exists.
+void BeginHostFrame(int frame_index, float framebuffer_scale = 0.f);
+
+// When set, filled atlas quads go here instead of ImDrawList::AddImage.
+// Pass nullptr to restore the ImGui path. Outline stroking still needs a
+// non-null ImDrawList.
+void SetGlyphQuadEmitter(EmitGlyphQuadFn fn, void* user = nullptr);
+
+// Route the live/morph render path through the public-domain Slug analytic-
+// coverage rasterizer when available (SlugRendererAvailable()). Single-pass,
+// supersample-free, curves fed directly to the GPU. Toggle live (e.g. a
+// checkbox) to A/B against the default signed-area coverage path.
+void PreferSlugRenderer(bool enable);
+bool PreferSlugRenderer();
+
+// Reconstruct morph glyphs on the GPU (base + Σ frac·delta from a static per-glyph
+// delta buffer, axis fractions as uniforms) instead of CPU-blending and re-uploading
+// curves each frame. An axis drag or zoom becomes a uniform update with no per-glyph
+// CPU outline work. Requires GpuMorphAvailable(); falls back transparently otherwise.
+// Default off. Toggle freely (live glyphs re-render through the active path).
+void PreferGpuMorphRenderer(bool enable);
+bool PreferGpuMorphRenderer();
+bool GpuMorphAvailable();
+bool SlugRendererAvailable();
+
+// Grid-fit small sizes (FreeType hinting). Hinting only matters at small sizes, and the
+// only way to be truly on par with FreeType is to use FreeType: when enabled, filled
+// glyphs below a pixel-size cutoff are rendered through FreeType's own autohinter +
+// grayscale raster (FT_LOAD_FORCE_AUTOHINT + FT_Render_Glyph) straight into the glyph
+// cache -- literally FreeType, no shape distortion. Each snapshot is keyed by glyph,
+// em, and the current variation instance (axis values); static text reuses the cache,
+// while a live morph re-rasterizes into a transient page when axes move (cheap at
+// small ppem). Above the cutoff it is a no-op and the analytic outline / GPU morph
+// fast path is used (large text needs no hinting). Off by default; toggle freely.
+void PreferGridFit(bool enable);
+bool PreferGridFit();
+
+// Grid-fit mode:
+//   Off      - no hinting (analytic outline / GPU morph; best for large/animated text).
+//   FreeType - FreeType's own autohinter + grayscale raster into the glyph cache below
+//              the size cutoff. Guaranteed FreeType parity; runs static and under morph.
+// PreferGridFit(bool) is a thin alias: true => FreeType, false => Off.
+enum class GridFitMode { Off, FreeType };
+void        PreferGridFitMode(GridFitMode mode);
+GridFitMode PreferGridFitMode();
+
+// Pixel-size cutoff (logical px/em) below which grid-fit hinting applies; at or above it
+// hinting is a no-op. Default 28. Clamped to a sane range.
+void  PreferGridFitMaxPx(float px);
+float PreferGridFitMaxPx();
+
+// Per-frame CPU render profile for the most recently completed frame. Lets a HUD
+// attribute frame cost to the morph outline blend vs. the rasterization submission,
+// and infer "GPU/other" as (wall-clock frame − blendMs − rasterMs). Timers are
+// CPU-side only, so a frame where blendMs+rasterMs is far below the frame time is
+// GPU-bound (fill/vsync); one where they dominate is CPU-bound (blend or GL submit).
+struct RenderProfile {
+    float blendMs  = 0.f;  // CPU time in the morph outline blend (cells, FT, reconstruct)
+    float rasterMs = 0.f;  // CPU time submitting glyph rasterization (recon + coverage draws)
+    int   glyphs   = 0;    // glyphs drawn through the fill path this frame
+    int   rebuilds = 0;    // morph cells (re)sampled this frame (0 = pure reuse/idle)
+};
+RenderProfile GetRenderProfile();
 
 RenderMode    GetRenderMode(const Face* face);
 void          SetRenderMode(Face* face, RenderMode mode);
@@ -126,6 +242,40 @@ float GetGposPairExtraPx(const Face* face, unsigned int cp_left, unsigned int cp
 void KernTableUi(const Face* face, float em_px);
 
 // ---------------------------------------------------------------------------
+// OpenType features  (GSUB/GPOS shaping: ligatures, small caps, stylistic sets…)
+//
+// Requires HarfBuzz at build time (IMVARFONT_USE_HARFBUZZ). Without HarfBuzz the
+// settings are stored but have no effect on shaping. Substitution features (e.g.
+// 'liga', 'smcp', 'onum', 'ss01') change which glyphs are produced, so shaping
+// runs through HarfBuzz whenever any feature is set — even for fonts with no GPOS.
+// ---------------------------------------------------------------------------
+
+struct FeatureSetting {
+    ImU32    Tag   = 0;            // 4-char OpenType feature tag, e.g. 'liga'
+    uint32_t Value = 1;           // 0 = off, 1 = on, N = select alternate N
+    uint32_t Start = 0;           // first cluster the setting applies to
+    uint32_t End   = 0xFFFFFFFFu; // one-past-last cluster (global by default)
+};
+
+// Enable/select a feature by 4-char tag ("liga", "smcp", "ss01", "onum"…).
+// value: 0 disables, 1 enables, N selects alternate N (for 'aalt'/'salt'/'cvNN').
+void SetFeature(Face* face, const char* tag, uint32_t value = 1);
+void SetFeatureRange(Face* face, const char* tag, uint32_t value,
+                     uint32_t start, uint32_t end);
+
+// Parse a comma/space separated list and replace the current feature set, e.g.
+// "liga, ss01=1, onum, -kern, +smcp". Returns the number of features applied.
+int  SetFeaturesString(Face* face, const char* features);
+
+void ClearFeature(Face* face, const char* tag);
+void ClearAllFeatures(Face* face);
+
+int                   GetFeatureCount(const Face* face);
+const FeatureSetting* GetFeatures(const Face* face);   // valid until FreeFace()
+bool                  GetFeatureValue(const Face* face, const char* tag,
+                                      uint32_t* out_value);
+
+// ---------------------------------------------------------------------------
 // Axis control
 // ---------------------------------------------------------------------------
 
@@ -145,9 +295,25 @@ void  ResetAxes(Face* face);
 void  ApplyAxes(Face* face, bool allow_extrapolation = false);
 
 // ---------------------------------------------------------------------------
+// Axis morphing: re-rasterization-free variable-font interpolation.
+// When enabled (best paired with RenderMode::LoopBlinnLive), changing Axis::Value
+// no longer re-instances FreeType: the glyph outline is blended each frame from
+// a cached base outline plus per-axis main-effect deltas (O(axes), not 2^axes),
+// so dragging an axis is as cheap as moving a quad. You set Axis::Value directly
+// (no ApplyAxes needed) and the next AddText reflects it. Scales to high-axis
+// parametric fonts (e.g. Roboto Flex, 13 axes); inert axes are pruned per glyph.
+// allow_extrapolation lets Value exceed fvar min/max via linear continuation of
+// the outer master delta.
+void  EnableMorph(Face* face, bool enable, bool allow_extrapolation = false);
+bool  MorphEnabled(const Face* face);
+
+// ---------------------------------------------------------------------------
 // ImGui widgets
 // ---------------------------------------------------------------------------
 
+// Draw one slider per axis (immediate-mode: call every frame). Returns true only
+// on the frame a slider changes, and calls ApplyAxes() for you on change — you
+// do not need a separate ApplyAxes() call when driving axes through this widget.
 // When allow_extrapolation=true each axis shows an unclamped DragFloat
 // (infinite drag + click to type). Values beyond the font's fvar range are
 // clamped for FreeType but extrapolated visually in AddText().
@@ -166,27 +332,45 @@ ImFont* SetImGuiFont(ImFontAtlas* atlas, Face* face, float size_pixels);
 // Rendering  (outlines → ImDrawList, no texture atlas required)
 // ---------------------------------------------------------------------------
 
-// Render UTF-8 text as filled glyph outlines into dl.
+// Styling options for AddText (all fields have sensible defaults so you can
+// set only what you need).
 //
-//   em_px              : em-square size in screen pixels  (controls text size)
-//   pos                : top-left corner of the text block in screen coordinates
-//                        (baseline sits at pos.y + ascender * scale)
-//   col                : fill colour, e.g. IM_COL32(255, 255, 255, 255)
-//   fill               : when true, fill glyph contours
-//   outline            : when true, stroke each contour (can combine with fill)
-//   outline_thickness  : stroke width in pixels (only used when outline is true)
-//   line_height_px     : vertical advance per newline; 0 = font default
-//   letter_spacing_px  : extra gap after each glyph except the last on a line; 0 = none
+//   C++17 (portable):
+//     ImVarFont::TextStyle st;
+//     st.outline = true; st.line_height_px = h;
+//     ImVarFont::AddText(dl, face, em, pos, col, "Hello", st);
 //
-// Returns the total advance width of the rendered string in pixels.
+//   C++20 (designated initialisers):
+//     ImVarFont::AddText(dl, face, em, pos, col, "Hello",
+//                        { .outline = true, .line_height_px = h });
+struct TextStyle {
+    bool  fill              = true;   // fill glyph contours (GPU coverage / CPU FreeType)
+    bool  outline           = false;  // stroke each contour (combinable with fill)
+    float outline_thickness = 1.5f;   // stroke width in pixels (used when outline=true)
+    float line_height_px    = 0.f;    // vertical advance per newline; 0 = font default
+    float letter_spacing_px = 0.f;    // extra gap after each glyph except the last; 0 = none
+};
+
+// Render UTF-8 text into dl (or via SetGlyphQuadEmitter when dl is nullptr).
+//
+//   em_px : em-square size in screen pixels (controls text size)
+//   pos   : top-left corner of the text block; baseline = pos.y + ascender
+//   col   : colour, e.g. IM_COL32_WHITE
+//
+// dl may be nullptr when a GlyphQuad emitter is installed and only filled
+// glyphs are drawn (no outline stroke).
+//
+// Short form — fill with col, no outline, font-default line height:
+float AddText(ImDrawList* dl, Face* face,
+              float em_px, ImVec2 pos,
+              ImU32 col, const char* text);
+
+// Full control via TextStyle (named fields; style is not defaulted to avoid
+// ambiguity with the 6-arg form above):
 float AddText(ImDrawList* dl, Face* face,
               float em_px, ImVec2 pos,
               ImU32 col, const char* text,
-              bool fill = true,
-              bool outline = false,
-              float outline_thickness = 1.5f,
-              float line_height_px = 0.f,
-              float letter_spacing_px = 0.f);
+              const TextStyle& style);
 
 // Measure total advance width without rendering (useful for centring).
 float CalcTextWidth(Face* face, float em_px, const char* text,

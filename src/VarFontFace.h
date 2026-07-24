@@ -103,11 +103,28 @@ public:
 
     const char* kerningEngineLabel() const;
 
+    // OpenType feature shaping (GSUB/GPOS via HarfBuzz). Tags are 4-char strings
+    // such as "liga", "smcp", "onum", "ss01". value: 0 = off, 1 = on, N = alt N.
+    // Requires ImVarFont built with HarfBuzz; otherwise stored but inert.
+    void setOpenTypeFeature(const std::string& tag, uint32_t value = 1);
+    void clearOpenTypeFeature(const std::string& tag);
+    void clearOpenTypeFeatures();
+    int  setOpenTypeFeaturesString(const std::string& features);
+    bool getOpenTypeFeature(const std::string& tag, uint32_t& outValue) const;
+
     ofRectangle getStringBoundsMM(const std::string& utf8, float emMM,
                                   const StringLayoutOptions& opts = {}) const;
     
     void drawString(const std::string& utf8, float x, float y, float emSize,
                     const StringLayoutOptions& opts = {}) const;
+
+    /// Filled GPU coverage text on the OF canvas (varfont_gl atlas quads).
+    /// Requires ImVarFont::InitRenderer(). Uses ofGetFrameNum() + window pixel
+    /// scale for BeginHostFrame. Outline stroking is not supported here — use
+    /// drawString() / ImGui AddText for strokes.
+    void drawStringGpu(const std::string& utf8, float x, float y, float emSize,
+                       ofColor color = ofColor::white,
+                       const StringLayoutOptions& opts = {}) const;
 
 private:
     of::filesystem::path m_path;

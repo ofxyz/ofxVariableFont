@@ -1,10 +1,19 @@
 #include "ofApp.h"
 #include "imgui_internal.h"
 
+#include <GLFW/glfw3.h>
+
 #include <algorithm>
 #include <cstring>
 
 namespace {
+
+static void initVarFontGpuRenderer() {
+    if (!ImVarFont::InitRenderer(
+            reinterpret_cast<void* (*)(const char*)>(glfwGetProcAddress))) {
+        ofLogWarning("ofxVariableFont") << "GPU renderer init failed; filled glyphs may be skipped";
+    }
+}
 
 static const char* kSampleTexts[] = {
     "The quick brown fox jumps over the lazy dog",
@@ -38,10 +47,10 @@ static void normalisePath(char* path) {
 // ============================================================================
 
 void ofApp::setup() {
-    ofDisableArbTex(); // ImGui needs GL_TEXTURE_2D; ARB rects break raster preview
-    ofBackground(10, 10, 18);
+    ofDisableArbTex(); // ImGui + varfont_gl need GL_TEXTURE_2D
+    ofBackground(m_bgColor);
     ofSetFrameRate(60);
-    ofSetWindowTitle("ImVarFont  –  Variable Font Viewer");
+    ofSetWindowTitle("ofxVariableFont  –  Variable Font Viewer");
 
     m_gui.setup(nullptr, /*autoDraw=*/false,
                 ImGuiConfigFlags_DockingEnable |
@@ -55,11 +64,13 @@ void ofApp::setup() {
     ImTheme::Setup(ImTheme::Theme_SoDark_AccentBlue);
     applyUiFontSize();
 
+    initVarFontGpuRenderer();
     tryLoadFont(m_fontPathBuf);
 }
 
 void ofApp::exit() {
     m_rasterTex.clear();
+    ImVarFont::ShutdownRenderer();
     m_gui.exit();
 }
 
@@ -70,21 +81,63 @@ void ofApp::update() {}
 // ============================================================================
 
 void ofApp::draw() {
-    ofBackground(10, 10, 18);
+    ofBackground(m_bgColor);
 
     if (m_uiFontDirty)
         rebuildUiFont();
+
+    // Main specimen: GPU coverage on the OF canvas (not ImDrawList).
+    drawOfCanvasText();
 
     m_gui.begin();
 
     drawDockSpace();
     drawControlsWindow();
-    drawPreviewWindow();
+    if (m_showImGuiPreview)
+        drawImGuiPreviewWindow();
     drawMetadataWindow();
     drawKernWindow();
 
     m_gui.end();
     m_gui.draw();
+}
+
+void ofApp::drawOfCanvasText() {
+    ImVarFont::Face* ivf = m_face.imVarFace();
+    if (!ivf)
+        return;
+
+    syncRenderSettings();
+
+    // Raster mode is CPU bitmap — keep that on the optional ImGui preview.
+    if (m_renderModeIdx == (int)ImVarFont::RenderMode::Raster)
+        return;
+
+    const float emPx = m_emPx * m_previewZoom;
+    const float lineH = ImVarFont::CalcLineHeightPx(ivf, emPx) * m_lineHeightMult;
+    const float letterSp = m_letterSpacingEm * emPx;
+    float textW = 0.f, textH = 0.f;
+    calcTextBlock(ivf, emPx, lineH, letterSp, m_textBuf, &textW, &textH);
+
+    const float posX = ofGetWidth() * 0.5f - textW * 0.5f + m_previewPan.x;
+    const float posY = ofGetHeight() * 0.5f - textH * 0.5f + m_previewPan.y;
+
+    varfont::StringLayoutOptions opts;
+    opts.lineHeightMult  = m_lineHeightMult;
+    opts.letterSpacingEm = m_letterSpacingEm;
+
+    if (m_fill) {
+        m_face.drawStringGpu(m_textBuf, posX, posY, emPx, m_textColor, opts);
+    }
+    if (m_outline) {
+        ofPushStyle();
+        ofSetColor(m_textColor);
+        ofNoFill();
+        ofSetLineWidth(m_thickness * m_previewZoom);
+        for (const auto& p : m_face.getStringPaths(m_textBuf, posX, posY, emPx, opts))
+            p.draw();
+        ofPopStyle();
+    }
 }
 
 // ============================================================================
@@ -128,14 +181,14 @@ void ofApp::setupDockLayout(ImGuiID dockspaceId) {
     ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->WorkSize);
 
     ImGuiID dockMain = dockspaceId;
-    ImGuiID dockLeft = ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Left, 0.22f, nullptr, &dockMain);
+    ImGuiID dockLeft = ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Left, 0.24f, nullptr, &dockMain);
     ImGuiID dockRight = ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Right, 0.26f, nullptr, &dockMain);
     ImGuiID dockBottom = ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Down, 0.28f, nullptr, &dockMain);
 
     ImGui::DockBuilderDockWindow("Controls",   dockLeft);
-    ImGui::DockBuilderDockWindow("Preview",    dockMain);
     ImGui::DockBuilderDockWindow("Metadata",   dockRight);
     ImGui::DockBuilderDockWindow("Kern table", dockBottom);
+    // Central node stays empty (passthru) so OF GPU text shows through.
     ImGui::DockBuilderFinish(dockspaceId);
 }
 
@@ -230,12 +283,13 @@ void ofApp::drawControlsWindow() {
     ImGui::Text("Render mode");
     ImGui::SetNextItemWidth(-1.f);
     if (ImGui::Combo("##renderMode", &m_renderModeIdx,
-                     "Vector\0Hinted vector\0Raster\0")) {
+                     "Vector\0Hinted vector\0Raster\0Loop-Blinn\0Loop-Blinn (live)\0")) {
         syncRenderSettings();
         m_rasterDirty = true;
     }
 
-    if (m_renderModeIdx != 0) {
+    if (m_renderModeIdx == (int)ImVarFont::RenderMode::HintedVector ||
+        m_renderModeIdx == (int)ImVarFont::RenderMode::Raster) {
         ImGui::Text("Hinting");
         ImGui::SetNextItemWidth(-1.f);
         if (ImGui::Combo("##hinting", &m_hintingIdx,
@@ -245,17 +299,26 @@ void ofApp::drawControlsWindow() {
         }
     }
 
-    if (m_renderModeIdx == 2) {
-        ImGui::TextDisabled("Fill / outline apply to vector modes only");
-    } else {
-        ImGui::Checkbox("Fill", &m_fill);
+    if (m_renderModeIdx != (int)ImVarFont::RenderMode::Raster) {
+        if (ImGui::Checkbox("Force CPU fallback (test)", &m_forceCpuFill))
+            ImVarFont::ForceCpuFallback(m_forceCpuFill);
         ImGui::SameLine();
-        ImGui::Checkbox("Outline", &m_outline);
+        ImGui::TextDisabled(ImVarFont::RendererReady() ? "(GPU ready)" : "(no GPU)");
+    }
+
+    if (m_renderModeIdx == (int)ImVarFont::RenderMode::Raster) {
+        ImGui::TextDisabled("Raster uses the optional ImGui preview window");
+        ImGui::Checkbox("Show ImGui preview", &m_showImGuiPreview);
+    } else {
+        ImGui::Checkbox("Fill (OF GPU canvas)", &m_fill);
+        ImGui::SameLine();
+        ImGui::Checkbox("Outline (ofPath)", &m_outline);
         if (m_outline) {
             ImGui::Text("Outline thickness");
             ImGui::SetNextItemWidth(-1.f);
             ImGui::SliderFloat("##thick", &m_thickness, 0.5f, 8.f, "%.1f px");
         }
+        ImGui::Checkbox("Also show ImGui preview", &m_showImGuiPreview);
     }
 
     ImVarFont::Face* ivf = m_face.imVarFace();
@@ -296,94 +359,122 @@ void ofApp::drawControlsWindow() {
     }
 
     ImGui::Spacing();
-    if (ImGui::ColorEdit3("Text", (float*)&m_textColor, ImGuiColorEditFlags_NoInputs))
-        m_rasterDirty = true;
-    ImGui::SameLine();
-    ImGui::ColorEdit3("BG", (float*)&m_bgColor, ImGuiColorEditFlags_NoInputs);
+    {
+        ImVec4 tc(m_textColor.r / 255.f, m_textColor.g / 255.f,
+                  m_textColor.b / 255.f, m_textColor.a / 255.f);
+        ImVec4 bc(m_bgColor.r / 255.f, m_bgColor.g / 255.f,
+                  m_bgColor.b / 255.f, m_bgColor.a / 255.f);
+        if (ImGui::ColorEdit3("Text", (float*)&tc, ImGuiColorEditFlags_NoInputs)) {
+            m_textColor.set(tc.x * 255.f, tc.y * 255.f, tc.z * 255.f, tc.w * 255.f);
+            m_rasterDirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::ColorEdit3("BG", (float*)&bc, ImGuiColorEditFlags_NoInputs)) {
+            m_bgColor.set(bc.x * 255.f, bc.y * 255.f, bc.z * 255.f, bc.w * 255.f);
+        }
+    }
 
     if (ivf && m_face.isVariable()) {
         ImGui::SeparatorText("Axes");
         if (ImVarFont::AxisSliders(ivf, "##axes", m_extrapolate)) {
             ImVarFont::ApplyAxes(ivf, m_extrapolate);
-#ifdef IMGUI_ENABLE_FREETYPE
+            m_face.pullAxesFromImVar();
             if (m_useFontForUi) m_uiFontDirty = true;
-#endif
             m_rasterDirty = true;
         }
         if (ImGui::Checkbox("Extrapolate beyond limits", &m_extrapolate)) {
             ImVarFont::ApplyAxes(ivf, m_extrapolate);
+            if (m_morph) ImVarFont::EnableMorph(ivf, true, m_extrapolate);
             m_rasterDirty = true;
         }
+        if (ImGui::Checkbox("Morph axes (no re-raster)", &m_morph)) {
+            ImVarFont::EnableMorph(ivf, m_morph, m_extrapolate);
+            if (!m_morph) ImVarFont::ApplyAxes(ivf, m_extrapolate);
+            m_rasterDirty = true;
+        }
+        if (m_morph)
+            ImGui::TextDisabled(ImVarFont::RendererReady()
+                                ? "Knot-lattice blend (live GPU coverage)"
+                                : "Needs GPU renderer; inactive on this backend");
+
+        if (ImVarFont::SlugRendererAvailable()) {
+            bool slug = ImVarFont::PreferSlugRenderer();
+            if (ImGui::Checkbox("Exact-curve coverage (analytic GPU)", &slug))
+                ImVarFont::PreferSlugRenderer(slug);
+            if (slug)
+                ImGui::TextDisabled("Exact-area coverage on quadratics (no flattening)");
+        } else {
+            ImGui::TextDisabled("Exact-curve coverage: unavailable on this backend");
+        }
+
+        if (m_morph && ImVarFont::GpuMorphAvailable()) {
+            bool gpum = ImVarFont::PreferGpuMorphRenderer();
+            if (ImGui::Checkbox("GPU morph reconstruction (base + frac*delta)", &gpum))
+                ImVarFont::PreferGpuMorphRenderer(gpum);
+            if (gpum)
+                ImGui::TextDisabled("Axis/zoom = uniform update; control points rebuilt on GPU");
+        } else if (m_morph) {
+            ImGui::TextDisabled("GPU morph reconstruction: unavailable on this backend");
+        }
+
+        bool gf = ImVarFont::PreferGridFit();
+        if (ImGui::Checkbox("FreeType-hint small text", &gf)) {
+            ImVarFont::PreferGridFit(gf);
+            m_rasterDirty = true;
+        }
+        if (gf) {
+            float maxPx = ImVarFont::PreferGridFitMaxPx();
+            if (ImGui::SliderFloat("Max px/em", &maxPx, 8.f, 48.f, "%.0f")) {
+                ImVarFont::PreferGridFitMaxPx(maxPx);
+                m_rasterDirty = true;
+            }
+            ImGui::TextDisabled("FreeType raster below %.0f px/em; analytic above", maxPx);
+        }
+    }
+
+    ImGui::SeparatorText("View");
+    ImGui::TextDisabled("Drag canvas to pan · scroll to zoom · R resets axes");
+    ImGui::Text("Zoom %.2fx", m_previewZoom);
+    if (ImGui::Button("Reset view")) {
+        m_previewPan  = { 0.f, 0.f };
+        m_previewZoom = 1.f;
+        m_rasterDirty = true;
     }
 
     ImGui::End();
 }
-
-// ============================================================================
-// Preview
-// ============================================================================
 
 void ofApp::calcTextBlock(ImVarFont::Face* face, float emPx, float lineHeightPx,
                           float letterSpacingPx, const char* text,
                           float* outW, float* outH) const {
     const float asc  = ImVarFont::CalcAscenderPx(face, emPx);
     const float desc = ImVarFont::CalcDescenderPx(face, emPx);
-    const float lineH = lineHeightPx;
-
     float maxW = 0.f;
-    int lines = 1;
+    int lines = 0;
     const char* lineStart = text;
     for (const char* p = text; ; ++p) {
         if (*p == '\n' || *p == '\0') {
             maxW = std::max(maxW, calcLineWidth(face, emPx, letterSpacingPx, lineStart, p));
-            if (*p == '\0') break;
             ++lines;
+            if (*p == '\0') break;
             lineStart = p + 1;
         }
     }
-
+    if (lines < 1) lines = 1;
     *outW = maxW;
-    *outH = asc + desc + (lines - 1) * lineH;
+    *outH = asc + desc + (lines - 1) * lineHeightPx;
 }
 
-void ofApp::drawPreviewWindow() {
-    ImGui::PushStyleColor(ImGuiCol_WindowBg,
-                          ImGui::ColorConvertFloat4ToU32(m_bgColor));
-    ImGui::Begin("Preview", nullptr, ImGuiWindowFlags_NoScrollbar);
-    ImGui::PopStyleColor();
+// ============================================================================
+// Optional ImGui-side preview (comparison / Raster mode)
+// ============================================================================
+
+void ofApp::drawImGuiPreviewWindow() {
+    ImGui::Begin("ImGui preview");
 
     const ImVec2 canvasPos  = ImGui::GetCursorScreenPos();
     const ImVec2 canvasSize = ImGui::GetContentRegionAvail();
-
-    ImGui::InvisibleButton("##preview_canvas", canvasSize,
-                           ImGuiButtonFlags_MouseButtonLeft);
-    const bool canvasHovered = ImGui::IsItemHovered();
-    const bool canvasActive  = ImGui::IsItemActive();
-
-    ImGuiIO& io = ImGui::GetIO();
-    if (canvasHovered && io.MouseWheel != 0.f) {
-        const ImVec2 center = {
-            canvasPos.x + canvasSize.x * 0.5f,
-            canvasPos.y + canvasSize.y * 0.5f
-        };
-        const ImVec2 world = {
-            (io.MousePos.x - center.x - m_previewPan.x) / m_previewZoom,
-            (io.MousePos.y - center.y - m_previewPan.y) / m_previewZoom
-        };
-        m_previewZoom *= (1.f + io.MouseWheel * 0.12f);
-        m_previewZoom = std::clamp(m_previewZoom, 0.05f, 20.f);
-        m_previewPan.x = io.MousePos.x - center.x - world.x * m_previewZoom;
-        m_previewPan.y = io.MousePos.y - center.y - world.y * m_previewZoom;
-        m_rasterDirty = true;
-    }
-    if (canvasActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
-        m_previewPan = { m_previewPan.x + io.MouseDelta.x,
-                         m_previewPan.y + io.MouseDelta.y };
-    if (canvasHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-        m_previewPan  = { 0.f, 0.f };
-        m_previewZoom = 1.f;
-        m_rasterDirty = true;
-    }
+    ImGui::InvisibleButton("##canvas", canvasSize);
 
     ImVarFont::Face* ivf = m_face.imVarFace();
     if (ivf) {
@@ -398,10 +489,10 @@ void ofApp::drawPreviewWindow() {
             canvasPos.x + canvasSize.x * 0.5f,
             canvasPos.y + canvasSize.y * 0.5f
         };
-        const float posX = center.x - textW * 0.5f + m_previewPan.x;
-        const float posY = center.y - textH * 0.5f + m_previewPan.y;
+        const float posX = center.x - textW * 0.5f;
+        const float posY = center.y - textH * 0.5f;
 
-        const ImU32 col = ImGui::ColorConvertFloat4ToU32(m_textColor);
+        const ImU32 col = IM_COL32(m_textColor.r, m_textColor.g, m_textColor.b, m_textColor.a);
         ImDrawList* dl = ImGui::GetWindowDrawList();
 
         if (m_renderModeIdx == (int)ImVarFont::RenderMode::Raster) {
@@ -422,8 +513,8 @@ void ofApp::drawPreviewWindow() {
                 m_rasterDirty = false;
             }
             if (m_rasterTex.isAllocated()) {
-                const float drawX = center.x - m_rasterTex.getWidth() * 0.5f + m_previewPan.x;
-                const float drawY = center.y - m_rasterTex.getHeight() * 0.5f + m_previewPan.y;
+                const float drawX = center.x - m_rasterTex.getWidth() * 0.5f;
+                const float drawY = center.y - m_rasterTex.getHeight() * 0.5f;
                 const float texW = (float)m_rasterTex.getWidth();
                 const float texH = (float)m_rasterTex.getHeight();
                 dl->AddImage(
@@ -432,18 +523,16 @@ void ofApp::drawPreviewWindow() {
                     ImVec2(drawX + texW, drawY + texH));
             }
         } else {
-            ImVarFont::AddText(dl, ivf, emPx, ImVec2(posX, posY),
-                               col, m_textBuf, m_fill, m_outline,
-                               m_thickness * m_previewZoom, lineH, letterSp);
+            ImVarFont::TextStyle st;
+            st.fill              = m_fill;
+            st.outline           = m_outline;
+            st.outline_thickness = m_thickness * m_previewZoom;
+            st.line_height_px    = lineH;
+            st.letter_spacing_px = letterSp;
+            ImVarFont::AddText(dl, ivf, emPx, ImVec2(posX, posY), col, m_textBuf, st);
         }
     } else {
-        const char* hint = "Drop a .ttf / .otf file here,  or enter its path and press Enter";
-        const ImVec2 ts = ImGui::CalcTextSize(hint);
-        ImGui::SetCursorScreenPos({
-            canvasPos.x + (canvasSize.x - ts.x) * 0.5f,
-            canvasPos.y + (canvasSize.y - ts.y) * 0.5f
-        });
-        ImGui::TextDisabled("%s", hint);
+        ImGui::TextDisabled("Load a font to preview");
     }
 
     ImGui::End();
@@ -485,7 +574,7 @@ void ofApp::tryLoadFont(const std::string& path) {
         syncRenderSettings();
         m_uiFontDirty = true;
         m_rasterDirty = true;
-        ofSetWindowTitle("ImVarFont  –  Variable Font Viewer  —  " + m_face.familyName());
+        ofSetWindowTitle("ofxVariableFont  –  " + m_face.familyName());
     } else {
         snprintf(m_loadError, sizeof(m_loadError), "Failed to load: %s", m_fontPathBuf);
     }
@@ -496,6 +585,7 @@ void ofApp::syncRenderSettings() {
     if (!ivf) return;
     ImVarFont::SetRenderMode(ivf, (ImVarFont::RenderMode)m_renderModeIdx);
     ImVarFont::SetHintingFlags(ivf, (ImVarFont::HintingFlags)m_hintingIdx);
+    ImVarFont::EnableMorph(ivf, m_morph, m_extrapolate);
 }
 
 void ofApp::applyUiFontSize() {
@@ -539,9 +629,28 @@ void ofApp::keyPressed(int key) {
     if ((key == 'r' || key == 'R') && m_face.imVarFace()) {
         ImVarFont::ResetAxes(m_face.imVarFace());
         ImVarFont::ApplyAxes(m_face.imVarFace(), m_extrapolate);
+        m_face.pullAxesFromImVar();
         m_rasterDirty = true;
 #ifdef IMGUI_ENABLE_FREETYPE
         if (m_useFontForUi) m_uiFontDirty = true;
 #endif
     }
+}
+
+void ofApp::mouseDragged(int x, int y, int button) {
+    if (button != OF_MOUSE_BUTTON_LEFT) return;
+    // Don't pan while interacting with ImGui.
+    if (ImGui::GetCurrentContext() && (ImGui::GetIO().WantCaptureMouse))
+        return;
+    m_previewPan.x += ofGetMouseX() - ofGetPreviousMouseX();
+    m_previewPan.y += ofGetMouseY() - ofGetPreviousMouseY();
+    m_rasterDirty = true;
+}
+
+void ofApp::mouseScrolled(ofMouseEventArgs& mouse) {
+    if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse)
+        return;
+    const float factor = (mouse.scrollY > 0.f) ? 1.1f : (1.f / 1.1f);
+    m_previewZoom = ofClamp(m_previewZoom * factor, 0.15f, 8.f);
+    m_rasterDirty = true;
 }

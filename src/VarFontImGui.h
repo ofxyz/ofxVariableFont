@@ -27,9 +27,14 @@ inline float drawToImGui(ImDrawList* dl, VarFontFace& face,
 
     const float lineH = ImVarFont::CalcLineHeightPx(ivf, emPx) * opts.lineHeightMult;
     const float letterSp = opts.letterSpacingEm * emPx;
-    return ImVarFont::AddText(dl, ivf, emPx, pos, col, text,
-                              opts.fill, opts.outline, opts.outlineThickness,
-                              lineH, letterSp);
+
+    ImVarFont::TextStyle st;
+    st.fill              = opts.fill;
+    st.outline           = opts.outline;
+    st.outline_thickness = opts.outlineThickness;
+    st.line_height_px    = lineH;
+    st.letter_spacing_px = letterSp;
+    return ImVarFont::AddText(dl, ivf, emPx, pos, col, text, st);
 }
 
 } // namespace varfont

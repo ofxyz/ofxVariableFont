@@ -17,6 +17,8 @@ public:
     void exit()   override;
     void dragEvent(ofDragInfo dragInfo) override;
     void keyPressed(int key) override;
+    void mouseDragged(int x, int y, int button) override;
+    void mouseScrolled(ofMouseEventArgs& mouse) override;
 
 private:
     ofxImGui::Gui  m_gui;
@@ -29,7 +31,7 @@ private:
 
     varfont::VarFontFace m_face;
     bool           m_fontLoaded = false;
-    char           m_fontPathBuf[512] = "fonts/Sixtyfour.otf";
+    char           m_fontPathBuf[512] = "fonts/Sixtyfour[BLED,SCAN].ttf";
     char           m_loadError[256]   = "";
     char           m_textBuf[4096]    = "The quick brown fox\njumps over the lazy dog";
 
@@ -40,11 +42,14 @@ private:
     bool           m_fill            = true;
     bool           m_outline         = false;
     bool           m_extrapolate     = false;
+    bool           m_morph           = false;
+    bool           m_forceCpuFill    = false;
+    bool           m_showImGuiPreview = false;
 
-    ImVec4         m_textColor { 1.f, 1.f, 1.f, 1.f };
-    ImVec4         m_bgColor   { 0.04f, 0.04f, 0.07f, 1.f };
+    ofColor        m_textColor { 255, 255, 255, 255 };
+    ofColor        m_bgColor   { 10, 10, 18, 255 };
 
-    ImVec2         m_previewPan  { 0.f, 0.f };
+    glm::vec2      m_previewPan  { 0.f, 0.f };
     float          m_previewZoom = 1.f;
 
     int            m_renderModeIdx = 0;
@@ -61,9 +66,10 @@ private:
     void setupDockLayout(ImGuiID dockspaceId);
     void drawDockSpace();
     void drawControlsWindow();
-    void drawPreviewWindow();
+    void drawImGuiPreviewWindow();
     void drawMetadataWindow();
     void drawKernWindow();
+    void drawOfCanvasText();
 
     void calcTextBlock(ImVarFont::Face* face, float emPx, float lineHeightPx,
                        float letterSpacingPx, const char* text,
